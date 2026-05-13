@@ -46,17 +46,48 @@
 int
 ssh_get_random(void *where, int len, int strong)
 {
-#ifdef HAVE_OPENSSL_RAND_PRIV_BYTES
-    if (strong) {
-        /* Returns -1 when not supported, 0 on error, 1 on success */
-        return !!RAND_priv_bytes(where, len);
-    }
-#else
-    (void)strong;
-#endif /* HAVE_RAND_PRIV_BYTES */
+    /* ======================================================================
+     *  FUZZING VARIANT: WITHOUT RANDOMNESS  (deterministic xorshift64 PRNG)
+     * ======================================================================
+     *
+     *  AFL-friendly RNG: replace OpenSSL's RAND_bytes/RAND_priv_bytes with
+     *  a fixed-seed xorshift64 stream so every run with the same fuzz input
+     *  takes the same code path — required for high AFL coverage stability.
+     *
+     *  Every consumer of randomness in libssh (KEX cookie, x25519/curve25519
+     *  ephemerals, ed25519/RSA/DSA nonces, packet padding, channel cookies,
+     *  PKI containers, mlkem/sntrup761) routes through ssh_get_random(), so
+     *  this single function controls determinism for the whole library.
+     *  The static state lives in the AFL forkserver parent and never
+     *  advances there, so every forked child starts from the same seed.
+     *
+     *  To switch back to OpenSSL's RNG, revert this hunk.
+     * ====================================================================== */
+    static unsigned long long fuzz_prng_state = 0x123456789abcdef0ULL;
+    unsigned char *buf = (unsigned char *)where;
+    int remaining = len;
 
-    /* Returns -1 when not supported, 0 on error, 1 on success */
-    return !!RAND_bytes(where, len);
+    (void)strong;
+
+    if (where == NULL || len <= 0) {
+        return 0;
+    }
+
+    while (remaining > 0) {
+        unsigned long long x = fuzz_prng_state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        fuzz_prng_state = x;
+        int n = (remaining < 8) ? remaining : 8;
+        int j;
+        for (j = 0; j < n; j++) {
+            buf[j] = (unsigned char)(x >> (j * 8));
+        }
+        buf += n;
+        remaining -= n;
+    }
+    return 1;
 }
 
 /**
